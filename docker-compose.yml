@@ -1,0 +1,142 @@
+# Wave Parser - Docker Compose Configuration
+#
+# Usage:
+#   1. cp .env.example .env
+#   2. Edit .env with your settings (especially JWT_SECRET)
+#   3. docker compose up --build
+#
+# For production on Render:
+#   - Deploy backend+worker+postgres+rabbitmq as a Docker service
+#   - Deploy client (frontend) separately on Netlify
+#   - Set ALLOWED_ORIGINS in backend to your Netlify URL
+#
+# Scale workers for more throughput:
+#   docker compose up --scale worker=3
+
+name: wave-parser
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: honeycomb
+      POSTGRES_USER: ${POSTGRES_USER:-praful}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d honeycomb"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    # Security: no ports exposed, only accessible internally
+    networks:
+      - backend
+
+  rabbitmq:
+    image: rabbitmq:3-management
+    restart: unless-stopped
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-guest}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:-guest}
+    # Management UI on separate port - do NOT expose publicly in production
+    ports:
+      - "15673:15672"
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+    networks:
+      - backend
+
+  backend:
+    build: ./filehandler
+    restart: unless-stopped
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/honeycomb
+      SPRING_DATASOURCE_USERNAME: ${POSTGRES_USER:-praful}
+      SPRING_DATASOURCE_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
+      SPRING_RABBITMQ_HOST: rabbitmq
+      SPRING_RABBITMQ_USERNAME: ${RABBITMQ_USER:-guest}
+      SPRING_RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD:-guest}
+      # IMPORTANT: Change this to a strong random value in production!
+      # Generate with: openssl rand -base64 48
+      JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET in .env — see .env.example}
+      APP_STORAGE_DIR: /data
+      APP_STORAGE_RETENTION_DAYS: ${APP_STORAGE_RETENTION_DAYS:-7}
+      # Frontend URL for CORS (set to your Netlify URL in production)
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-
+http://localhost:5173,
+https://*.netlify.app}
+    volumes:
+      # Shared volume for audio files (backend writes, worker reads)
+      - audio:/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8080/actuator/health | grep -q UP"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+    networks:
+      - backend
+
+  worker:
+    build: ./whisper
+    restart: unless-stopped
+    environment:
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_USER: ${RABBITMQ_USER:-guest}
+      RABBITMQ_PASS: ${RABBITMQ_PASSWORD:-guest}
+      HEARTBEAT_FILE: /tmp/worker.healthy
+      WHISPER_MODEL_SIZE: ${WHISPER_MODEL_SIZE:-base}
+      WHISPER_DEVICE: ${WHISPER_DEVICE:-cpu}
+      WHISPER_COMPUTE_TYPE: ${WHISPER_COMPUTE_TYPE:-int8}
+      WHISPER_VAD_FILTER: ${WHISPER_VAD_FILTER:-true}
+      WHISPER_TRANSLATE: ${WHISPER_TRANSLATE:-false}
+      CHUNK_MAX_ATTEMPTS: ${CHUNK_MAX_ATTEMPTS:-3}
+    volumes:
+      - audio:/data
+      # Cache Whisper model downloads between restarts
+      - whisper-cache:/root/.cache
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      backend:
+        condition: service_started
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /tmp/worker.healthy"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 120s
+    networks:
+      - backend
+
+  web:
+    build: ./client
+    restart: unless-stopped
+    ports:
+      # Only port exposed to the internet
+      - "8080:80"
+    depends_on:
+      backend:
+        condition: service_started
+    networks:
+      - backend
+
+volumes:
+  pgdata:  # PostgreSQL data
+  audio:   # Shared audio files between backend and worker
+  whisper-cache:  # Cached Whisper models
+
+networks:
+  backend:
+    driver: bridge

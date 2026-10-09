@@ -1,0 +1,86 @@
+# Wave Parser Backend
+# This runs the backend API + PostgreSQL + RabbitMQ
+# For full stack, deploy frontend separately (see frontend/README.md)
+#
+# Usage:
+#   docker compose up --build
+#
+# Environment variables (copy .env.example to .env and edit):
+#   - JWT_SECRET: Required! Generate with: openssl rand -base64 48
+#   - POSTGRES_PASSWORD: Change from default
+#   - RABBITMQ_PASSWORD: Change from default
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: honeycomb
+      POSTGRES_USER: ${POSTGRES_USER:-praful}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d honeycomb"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks:
+      - backend
+
+  rabbitmq:
+    image: rabbitmq:3-management
+    restart: unless-stopped
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-guest}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:-guest}
+    ports:
+      - "15672:15672"  # Management UI - DON'T expose in production
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+    networks:
+      - backend
+
+  backend:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/honeycomb
+      SPRING_DATASOURCE_USERNAME: ${POSTGRES_USER:-praful}
+      SPRING_DATASOURCE_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
+      SPRING_RABBITMQ_HOST: rabbitmq
+      SPRING_RABBITMQ_USERNAME: ${RABBITMQ_USER:-guest}
+      SPRING_RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD:-guest}
+      JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET in .env}
+      APP_STORAGE_DIR: /data
+      APP_STORAGE_RETENTION_DAYS: ${APP_STORAGE_RETENTION_DAYS:-7}
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-http://localhost:5173,https://*.netlify.app}
+    volumes:
+      - audio:/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/actuator/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+    networks:
+      - backend
+
+volumes:
+  pgdata:
+  audio:
+
+networks:
+  backend:
+    driver: bridge
