@@ -1,8 +1,10 @@
 package com.praful.filehandler;
 
 import org.junit.jupiter.api.Test;
+import org.springframework.boot.test.context.SpringBootTest;
 
-class FilehandlerApplicationTests extends AbstractIntegrationTest {
+@SpringBootTest
+class FilehandlerApplicationTests {
 
     @Test
     void contextLoads() {
