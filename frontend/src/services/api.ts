@@ -16,8 +16,17 @@ export const ALLOWED_FORMATS = ['wav', 'mp3', 'm4a', 'flac'] as const
 /** Maximum file size the backend accepts (100 MB) */
 export const MAX_FILE_SIZE_BYTES = 100 * 1024 * 1024
 
-/** API base path - configured via VITE_API_BASE_URL env var, defaults to /api */
-export const API_BASE = (import.meta.env.VITE_API_BASE_URL as string) || '/api'
+/**
+ * Backend origin - configured via VITE_API_BASE_URL env var.
+ * Empty in Docker/local so requests stay relative and nginx proxies /api.
+ * On Netlify set it to the Render backend URL, e.g. https://app.onrender.com
+ */
+export const API_BASE = (import.meta.env.VITE_API_BASE_URL as string) || ''
+
+/** Prefixes an absolute API path (e.g. "/api/jobs") with the configured backend origin. */
+function apiUrl(path: string): string {
+  return `${API_BASE}${path}`
+}
 
 export function getToken(): string | null {
   return localStorage.getItem(TOKEN_KEY)
@@ -73,7 +82,7 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
     headers.set('Content-Type', 'application/json')
   }
 
-  const response = await fetch(path, { ...init, headers })
+  const response = await fetch(apiUrl(path), { ...init, headers })
   if (!response.ok) {
     throw new ApiError(await readError(response), response.status)
   }
@@ -125,12 +134,12 @@ export const api = {
   remove: (id: string) => request<void>(`/api/jobs/${id}`, { method: 'DELETE' }),
 
   /** <audio> and EventSource cannot send headers, so the token goes in the query string. */
-  audioUrl: (id: string) => withToken(`/api/jobs/${id}/audio`),
+  audioUrl: (id: string) => withToken(apiUrl(`/api/jobs/${id}/audio`)),
 
-  eventsUrl: (id: string) => withToken(`/api/jobs/${id}/events`),
+  eventsUrl: (id: string) => withToken(apiUrl(`/api/jobs/${id}/events`)),
 
   exportUrl: (id: string, format: string) =>
-    withToken(`/api/jobs/${id}/export?format=${format}`),
+    withToken(apiUrl(`/api/jobs/${id}/export?format=${format}`)),
 }
 
 /** Uploads with a real progress bar; fetch cannot report request progress. */
@@ -140,7 +149,7 @@ export function uploadWithProgress(
 ): Promise<{ jobId: string; status: string }> {
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest()
-    xhr.open('POST', '/api/jobs')
+    xhr.open('POST', apiUrl('/api/jobs'))
     const token = getToken()
     if (token) {
       xhr.setRequestHeader('Authorization', `Bearer ${token}`)

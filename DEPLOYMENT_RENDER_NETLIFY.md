@@ -79,7 +79,10 @@ In the Render dashboard for your backend service, add these environment variable
 
 ```
 # Database (from Step 1.1)
-SPRING_DATASOURCE_URL=postgresql://user:pass@host:port/honeycomb
+# Use the host/port from Render's "Internal Database URL".
+# Spring Boot needs the "jdbc:" prefix. (A bare postgresql:// URL also works -
+# the app normalizes it automatically.)
+SPRING_DATASOURCE_URL=jdbc:postgresql://host:port/honeycomb
 SPRING_DATASOURCE_USERNAME=praful
 SPRING_DATASOURCE_PASSWORD=your-db-password
 
