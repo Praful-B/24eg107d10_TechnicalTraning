@@ -1,5 +1,6 @@
 package com.praful.filehandler.authentication;
 
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.http.HttpStatus;
@@ -18,19 +19,24 @@ import org.springframework.web.cors.CorsConfiguration;
 import org.springframework.web.cors.CorsConfigurationSource;
 import org.springframework.web.cors.UrlBasedCorsConfigurationSource;
 
+import java.util.Arrays;
 import java.util.List;
 
 /**
  * Security configuration: JWT authentication, stateless sessions, CORS for the frontend.
  *
  * The frontend on Netlify will call this backend, so we allow its origin.
- * In production, set ALLOWED_ORIGINS to your Netlify app URL.
+ * Set ALLOWED_ORIGINS env var to your Netlify app URL in production.
+ * Default includes localhost (dev) and *.netlify.app (Netlify deploys).
  */
 @Configuration
 @EnableWebSecurity
 public class SecurityConfig {
 
     private final JwtAuthFilter jwtAuthFilter;
+
+    @Value("${ALLOWED_ORIGINS:http://localhost:*,https://*.netlify.app}")
+    private String allowedOrigins;
 
     public SecurityConfig(JwtAuthFilter jwtAuthFilter) {
         this.jwtAuthFilter = jwtAuthFilter;
@@ -60,11 +66,9 @@ public class SecurityConfig {
     @Bean
     public CorsConfigurationSource corsConfigurationSource() {
         CorsConfiguration configuration = new CorsConfiguration();
-        // In production, replace with your Netlify URL: https://your-app.netlify.app
-        configuration.setAllowedOriginPatterns(List.of(
-                "http://localhost:*",
-                "https://*.netlify.app"
-        ));
+        // Parse ALLOWED_ORIGINS env var (comma-separated list of origins/patterns)
+        List<String> origins = Arrays.asList(allowedOrigins.split(","));
+        configuration.setAllowedOriginPatterns(origins);
         configuration.setAllowedMethods(List.of("GET", "POST", "PUT", "DELETE", "OPTIONS"));
         configuration.setAllowedHeaders(List.of("Authorization", "Content-Type"));
         configuration.setExposedHeaders(List.of("Authorization"));
@@ -84,5 +88,4 @@ public class SecurityConfig {
     @Bean
     public AuthenticationManager authenticationManager(AuthenticationConfiguration config) throws Exception {
         return config.getAuthenticationManager();
-    }
-}
+    }}

@@ -35,12 +35,14 @@ RUN mkdir -p /data && chown -R appuser:appgroup /data
 # Switch to non-root user
 USER appuser
 
-# Expose port
+# Expose port - Render assigns PORT env var, default to 8080
 EXPOSE 8080
+ENV PORT=8080
 
 # Health check
 HEALTHCHECK --interval=15s --timeout=5s --start-period=60s --retries=10 \
     CMD wget -qO- http://localhost:8080/actuator/health || exit 1
 
 # Run the application
-ENTRYPOINT ["java", "-jar", "app.jar"]
+# Render sets PORT env var; Spring Boot picks it up automatically
+ENTRYPOINT ["sh", "-c", "java -jar app.jar"]

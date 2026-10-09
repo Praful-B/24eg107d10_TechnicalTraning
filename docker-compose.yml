@@ -53,7 +53,7 @@ services:
       - backend
 
   backend:
-    build: ./filehandler
+    build: ./backend
     restart: unless-stopped
     environment:
       SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/honeycomb
@@ -68,9 +68,7 @@ services:
       APP_STORAGE_DIR: /data
       APP_STORAGE_RETENTION_DAYS: ${APP_STORAGE_RETENTION_DAYS:-7}
       # Frontend URL for CORS (set to your Netlify URL in production)
-      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-
-http://localhost:5173,
-https://*.netlify.app}
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-http://localhost:5173,https://*.netlify.app}
     volumes:
       # Shared volume for audio files (backend writes, worker reads)
       - audio:/data
@@ -121,7 +119,7 @@ https://*.netlify.app}
       - backend
 
   web:
-    build: ./client
+    build: ./frontend
     restart: unless-stopped
     ports:
       # Only port exposed to the internet
