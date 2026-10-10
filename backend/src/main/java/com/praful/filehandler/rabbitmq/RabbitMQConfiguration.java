@@ -9,6 +9,7 @@ import org.springframework.amqp.rabbit.listener.SimpleMessageListenerContainer;
 import org.springframework.amqp.support.converter.JacksonJsonMessageConverter;
 import org.springframework.amqp.support.converter.MessageConverter;
 import org.springframework.amqp.support.converter.SmartMessageConverter;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.core.ParameterizedTypeReference;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
@@ -129,7 +130,13 @@ public class RabbitMQConfiguration {
         return rabbitTemplate;
     }
 
+    /**
+     * The result consumer only exists in queue mode. In synchronous mode we never
+     * publish chunk work, so starting the listener would just spam connection
+     * attempts against the broker.
+     */
     @Bean
+    @ConditionalOnProperty(name = "app.transcription.mode", havingValue = "queue", matchIfMissing = true)
     SimpleMessageListenerContainer simpleMessageListenerContainer(ConnectionFactory connectionFactory,
                                                                   MessageProcesser messageProcesser,
                                                                   MessageConverter messageConverter) {

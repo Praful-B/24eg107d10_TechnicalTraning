@@ -24,4 +24,19 @@ public class AsyncConfig {
         executor.initialize();
         return executor;
     }
+
+    /**
+     * Single-threaded pool for the synchronous transcription mode. Whisper is
+     * memory hungry, so only one recording is decoded at a time.
+     */
+    @Bean(name = "transcriptionExecutor")
+    public TaskExecutor transcriptionExecutor() {
+        ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+        executor.setCorePoolSize(1);
+        executor.setMaxPoolSize(1);
+        executor.setQueueCapacity(50);
+        executor.setThreadNamePrefix("transcribe-");
+        executor.initialize();
+        return executor;
+    }
 }

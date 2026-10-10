@@ -1,5 +1,6 @@
 package com.praful.filehandler.upload;
 
+import com.praful.filehandler.transcription.LocalTranscriptionService;
 import com.praful.filehandler.user.UserRepository;
 import com.praful.filehandler.user.Users;
 import org.springframework.beans.factory.annotation.Value;
@@ -45,26 +46,32 @@ public class UploadService {
     private final UserRepository userRepository;
     private final JobEventService jobEventService;
     private final ChunkingService chunkingService;
+    private final LocalTranscriptionService localTranscriptionService;
     private final RateLimitService rateLimitService;
     private final ObjectMapper objectMapper;
     private final Path storageDir;
+    private final String transcriptionMode;
 
     public UploadService(UploadRepository uploadRepository,
                          ChunkResultRepository chunkResultRepository,
                          UserRepository userRepository,
                          JobEventService jobEventService,
                          ChunkingService chunkingService,
+                         LocalTranscriptionService localTranscriptionService,
                          RateLimitService rateLimitService,
                          ObjectMapper objectMapper,
-                         @Value("${app.storage.dir}") Path storageDir) {
+                         @Value("${app.storage.dir}") Path storageDir,
+                         @Value("${app.transcription.mode:queue}") String transcriptionMode) {
         this.uploadRepository = uploadRepository;
         this.chunkResultRepository = chunkResultRepository;
         this.userRepository = userRepository;
         this.jobEventService = jobEventService;
         this.chunkingService = chunkingService;
+        this.localTranscriptionService = localTranscriptionService;
         this.rateLimitService = rateLimitService;
         this.objectMapper = objectMapper;
         this.storageDir = storageDir;
+        this.transcriptionMode = transcriptionMode;
     }
 
     // ------------------------------------------------------------------
@@ -93,8 +100,8 @@ public class UploadService {
         Upload job = createJobEntity(jobId, user.getUserId(), originalName, target.toString());
         uploadRepository.save(job);
 
-        // Normalize and chunk off the request thread
-        chunkingService.process(jobId);
+        // Transcribe off the request thread (queue-based or synchronous, per config)
+        startTranscription(jobId);
         jobEventService.publish(JobEvent.from(job));
 
         return job;
@@ -214,7 +221,7 @@ public class UploadService {
         resetJobForRetry(job);
         uploadRepository.save(job);
 
-        chunkingService.process(jobId);
+        startTranscription(jobId);
         return job;
     }
 
@@ -280,6 +287,18 @@ public class UploadService {
         job.setContent(null);
         job.setSegmentsJson(null);
         job.setFailureReason(null);
+    }
+
+    /**
+     * Dispatch to the configured transcription mode: {@code queue} keeps the original
+     * RabbitMQ + Python worker flow, anything else runs the in-process engine.
+     */
+    private void startTranscription(UUID jobId) {
+        if ("queue".equalsIgnoreCase(transcriptionMode)) {
+            chunkingService.process(jobId);
+        } else {
+            localTranscriptionService.process(jobId);
+        }
     }
 
     private static String joinSegmentText(List<TranscriptSegment> segments) {
