@@ -1,107 +1,208 @@
 # Wave Parser
 
-Asynchronous, queue-driven audio transcription. The upload returns immediately with a
-job id; a Python worker transcribes chunks with a local Whisper model; results are
-stitched back together in order and pushed to the browser over SSE.
+Wave Parser turns audio into accurate, timestamped transcripts. Upload a file and the
+API returns a job id immediately; transcription happens asynchronously, progress streams
+back to the browser over Server-Sent Events (SSE), and the finished transcript can be
+searched, corrected, and exported as `txt`, `srt`, `vtt` or `json`.
 
+The project is a full-stack demonstration of an asynchronous, queue-driven pipeline:
+a Spring Boot API orchestrates the work, a Python worker runs a local Whisper model,
+and a React SPA presents the results.
+
+## Live deployment
+
+| | URL |
+| --- | --- |
+| Web app | <https://24eg107d10.netlify.app> |
+| API | <https://wave-parser-backend.onrender.com> |
+| API docs (Swagger UI) | <https://wave-parser-backend.onrender.com/swagger-ui.html> |
+| Health check | <https://wave-parser-backend.onrender.com/actuator/health> |
+
+The frontend is hosted on **Netlify**; the backend runs on **Render**. The app is no
+longer self-hosted — the links above are the canonical deployment. Render's free tier
+sleeps after ~15 minutes idle, so the first request may take 30–60 seconds to wake up.
+
+---
+
+## Architecture
+
+Wave Parser has three runtime roles — an API/orchestrator, a transcription worker, and a
+single-page client — glued together by a broker and two pieces of shared state.
+
+```mermaid
+flowchart TB
+    subgraph Browser
+        UI["React SPA<br/>Netlify · Vite · TypeScript"]
+    end
+
+    subgraph API["Spring Boot backend · Render"]
+        REST["REST controllers<br/>JWT auth + CORS"]
+        CHUNK["ChunkingService<br/>FFmpeg normalize + silence split"]
+        LOCAL["LocalTranscriptionService<br/>embedded whisper.cpp / hosted API"]
+        RESULT["MessageProcesser<br/>idempotent assembly"]
+        SSE["JobEventService<br/>SSE push"]
+    end
+
+    DB[("PostgreSQL<br/>users · jobs · chunks")]
+    MQ[("RabbitMQ<br/>pre · post · retry · dead-letter")]
+    STORE[("Audio storage<br/>16 kHz WAV + chunk files")]
+    WORKER["Python worker<br/>faster-whisper"]
+
+    UI <-->|"HTTPS /api"| REST
+    SSE -.->|"status events"| UI
+
+    REST --> CHUNK
+    REST --> LOCAL
+    CHUNK --> STORE
+    CHUNK -->|"chunk messages"| MQ
+    MQ --> WORKER
+    WORKER --> STORE
+    WORKER -->|"result messages"| MQ
+    MQ --> RESULT
+
+    LOCAL --> DB
+    LOCAL --> SSE
+    REST --> DB
+    RESULT --> DB
+    RESULT --> SSE
 ```
-browser ──► nginx ──► Spring Boot ──► RabbitMQ ──► Python worker (faster-whisper)
-                          │                              │
-                          │◄──── result messages ────────┘
-                          ▼
-                    Postgres (jobs, chunks)
-```
 
-## Services
+### Component responsibilities
 
-| Service | Path | What it does |
+| Component | Tech | Responsibility |
 | --- | --- | --- |
-| Backend | `filehandler/` | Upload, chunking, aggregation, auth, SSE, search, exports |
-| Worker | `whisper/` | Consumes chunk messages and runs faster-whisper |
-| Frontend | `client/` | React SPA: upload, job progress, transcript viewer |
-| Proxy | `client/nginx.conf` | Single entry point: serves the SPA and proxies `/api` |
+| **Frontend** | React 19, Vite, TypeScript, React Router | Upload with progress, job history, live progress, transcript viewer/editor, search, export, auth |
+| **Backend** | Spring Boot 4, Java 21 | Upload validation, JWT auth, FFmpeg chunking, job lifecycle, transcript assembly, SSE, exports |
+| **Worker** | Python 3.11, faster-whisper, pika | Consumes chunk messages, transcribes, publishes results |
+| **Broker** | RabbitMQ 3 | Chunk work queue, result queue, TTL retry queue, dead-letter queue |
+| **Database** | PostgreSQL 16 | Users, jobs, and per-chunk results |
+| **Storage** | Filesystem volume | Normalized audio and chunk files (shared by backend + worker in queue mode) |
 
-## How a job flows
+### Two transcription modes
 
-1. `POST /api/jobs` validates the upload (extension **and** file signature), stores it,
-   and returns a `jobId`. Normalizing and splitting happens off the request thread.
-2. FFmpeg normalizes the audio to 16 kHz mono WAV and cuts it on **silences**, with a
-   small overlap so words are never sliced. Each chunk becomes its own queue message
-   carrying `jobId`, `chunkIndex`, `totalChunks` and its start offset.
-3. Workers transcribe chunks independently (`prefetch_count=1`). A failing chunk is
-   retried through a delay queue and dead-lettered after `CHUNK_MAX_ATTEMPTS`.
-4. The backend stores each result idempotently (a redelivered chunk is ignored) and,
-   under a row-level lock, assembles the transcript in `chunkIndex` order once every
-   chunk has arrived. The overlap between chunks is trimmed so text is not duplicated.
-5. Progress and the finished transcript are pushed over `GET /api/jobs/{id}/events`.
+The backend can produce transcripts in two ways, selected by `TRANSCRIPTION_MODE`:
 
-## Deployment
+- **`queue`** (default) — the full asynchronous pipeline. The backend chunks audio and
+  publishes it to RabbitMQ; one or more Python workers transcribe in parallel; results
+  flow back and are assembled. This is the scalable path and the one shown below.
+- **`whispercpp` / `api`** — no broker or worker required. The backend transcribes the
+  whole file in-process using an embedded `whisper.cpp` binary, or by calling a hosted
+  OpenAI-compatible transcription API (e.g. Groq). This is the light path used on
+  constrained/free hosting where running a worker is impractical.
 
-### Option 1: All-in-one on Render (free tier)
+Both modes drive the same `PREPARING → PROCESSING → COMPLETED` state machine that the
+frontend already understands, so no UI changes are needed when switching.
 
-Deploy the entire stack (backend + worker + postgres + rabbitmq) as a Docker service:
+### How a job flows (queue mode)
 
-1. Push this repo to GitHub
-2. In Render, create a new **_web_service**:
-   - Connect your repo
-   - Build command: `docker compose build`
-   - Start command: `docker compose up`
-   - Add all environment variables from `.env.example`
-   - **Important:** Set `JWT_SECRET` to a strong random value (generate with `openssl rand -base64 48`)
-   - Set `ALLOWED_ORIGINS` to your Netlify URL (see Option 2)
-3. Render will give you a URL like `https://wave-parser.onrender.com`
+```mermaid
+sequenceDiagram
+    autonumber
+    participant U as Browser (SPA)
+    participant A as Spring Boot API
+    participant FF as FFmpeg
+    participant Q as RabbitMQ
+    participant W as Python worker
+    participant DB as PostgreSQL
 
-**Note:** The free tier spins down after 15 minutes of inactivity. The first request
-after idle will take 30-60 seconds to wake up.
+    U->>A: POST /api/jobs (audio multipart)
+    A->>A: validate extension + file signature, rate limit
+    A->>DB: save job (PREPARING)
+    A-->>U: 201 { jobId }
+    U->>A: GET /api/jobs/{id}/events (SSE)
 
-### Option 2: Frontend on Netlify, Backend on Render (recommended)
+    A->>FF: normalize to 16 kHz mono WAV
+    A->>FF: silencedetect, cut near silences
+    A->>DB: persist totalChunks
+    loop every chunk
+        A->>Q: publish chunk (jobId, index, offsets)
+    end
 
-This separates concerns and gives you better performance:
+    Q->>W: deliver chunk (prefetch = 1)
+    W->>W: faster-whisper transcribe
+    W->>Q: publish result
+    Q->>A: deliver result
+    A->>DB: store chunk (idempotent, row-locked)
+    A-->>U: SSE progress (chunksReceived / totalChunks)
 
-**Frontend (Netlify):**
-1. In Netlify, create a new site from Git
-2. Build command: `cd client && npm install && npm run build`
-3. Publish directory: `client/dist`
-4. Add environment variable: `VITE_API_BASE_URL=https://your-backend.onrender.com`
-
-**Backend (Render):**
-1. Same as Option 1, but set `ALLOWED_ORIGINS` to your Netlify URL:
-   - `ALLOWED_ORIGINS=https://your-app.netlify.app`
-
-### Local development
-
-```bash
-# Postgres and RabbitMQ
-docker compose up -d postgres rabbitmq
-
-# Backend (needs FFmpeg installed)
-cd filehandler && ./mvnw spring-boot:run
-
-# Worker
-cd whisper && uv sync && uv run whisper
-
-# Frontend (proxies /api to :8080)
-cd client && npm install && npm run dev
+    Note over A: once every chunk has arrived
+    A->>A: assemble in chunk order, trim overlap
+    A->>DB: save transcript (COMPLETED)
+    A-->>U: SSE COMPLETED
 ```
 
-### URLs
+Key reliability details:
 
-When running locally with Docker:
+1. **Immediate return.** The upload is validated and stored, then returns a `jobId`.
+   Normalizing and splitting run off the request thread on a bounded executor.
+2. **Silence-aware chunking.** FFmpeg normalizes to 16 kHz mono WAV, detects silences,
+   and prefers to cut at silence midpoints near the target chunk length. Chunks overlap
+   by a small amount so no word is sliced in half.
+3. **Retry with backoff, then dead-letter.** A failed chunk is republished through a TTL
+   retry queue (15 s delay) up to `CHUNK_MAX_ATTEMPTS`; messages that exhaust retries go
+   to the dead-letter queue and the job is marked `FAILED`.
+4. **Idempotent assembly.** A redelivered chunk is ignored. The job row is loaded with a
+   write lock, so concurrent results assemble safely. Overlap between adjacent chunks is
+   trimmed to avoid duplicated text.
+5. **Live updates.** Every state change is published to `JobEventService` and pushed to
+   the subscriber over SSE. The frontend also falls back to polling on reconnect.
 
-* App: http://localhost:8080
-* RabbitMQ management UI: http://localhost:15673
-* Swagger UI: http://localhost:8080/api/swagger-ui.html
+### Job state machine
 
-For local development (backend on 8080, frontend on 5173):
+```mermaid
+stateDiagram-v2
+    [*] --> PREPARING
+    PREPARING --> PROCESSING: chunks dispatched
+    PROCESSING --> COMPLETED: all chunks assembled
+    PREPARING --> FAILED: normalize / chunk error
+    PROCESSING --> FAILED: chunk exhausted retries
+    FAILED --> PREPARING: retry (original file kept)
+    COMPLETED --> [*]
+```
 
-* Frontend: http://localhost:5173 (proxies /api to backend)
-* Swagger UI: http://localhost:8080/api/swagger-ui.html
+A watchdog fails jobs stuck in `PROCESSING` for longer than `APP_JOB_TIMEOUT_MINUTES`
+so a lost worker can never hang a job forever. A nightly scheduler deletes audio and
+rows older than the retention window.
+
+---
+
+## Tech stack
+
+| Layer | Stack |
+| --- | --- |
+| Frontend | React 19, React Router 7, TypeScript, Vite |
+| Backend | Spring Boot 4.1, Java 21, Spring Security (JWT), Spring Data JPA, Spring AMQP |
+| Transcription | faster-whisper (Python worker) **or** whisper.cpp / OpenAI-compatible API (in-process) |
+| Media | FFmpeg / ffprobe |
+| Data | PostgreSQL 16, RabbitMQ 3 |
+| API docs | springdoc-openapi (Swagger UI) |
+| Packaging | Docker & Docker Compose |
+
+---
+
+## Repository layout
+
+```
+bee/
+├── backend/        Spring Boot API (Java 21, Maven)
+├── frontend/       React SPA (Vite, TypeScript, nginx config)
+├── whisper/        Python transcription worker (faster-whisper)
+├── docker-compose.yml        Full local stack (postgres, rabbitmq, backend, worker, web)
+├── .env.example              Every supported environment variable
+├── DEPLOYMENT_RENDER_NETLIFY.md   Production deployment walkthrough
+└── DEMO_CHANGES.md           How the in-process (no-worker) mode was added
+```
+
+---
 
 ## API
 
+All endpoints live under `/api` and require a JWT, except registration, login, and the
+public health/docs routes.
+
 | Method | Path | Purpose |
 | --- | --- | --- |
-| `POST` | `/api/auth/register`, `/api/auth/login` | Get a JWT |
+| `POST` | `/api/auth/register`, `/api/auth/login` | Register / log in, returns a JWT |
 | `POST` | `/api/jobs` | Upload audio, returns a job id |
 | `GET` | `/api/jobs` | Job history for the signed-in user |
 | `GET` | `/api/jobs/{id}` | Status and chunk progress |
@@ -109,49 +210,98 @@ For local development (backend on 8080, frontend on 5173):
 | `GET` | `/api/jobs/{id}/transcript` | Full transcript with segments |
 | `PUT` | `/api/jobs/{id}/transcript` | Save manual corrections |
 | `GET` | `/api/jobs/{id}/search?q=` | Phrase search with timestamps |
-| `GET` | `/api/jobs/{id}/audio` | Original audio (supports Range, for seeking) |
+| `GET` | `/api/jobs/{id}/audio` | Original audio (supports HTTP Range for seeking) |
 | `GET` | `/api/jobs/{id}/export?format=` | `txt`, `srt`, `vtt` or `json` |
 | `POST` | `/api/jobs/{id}/retry` | Re-run a failed job |
 | `DELETE` | `/api/jobs/{id}` | Delete a job, its chunks and its audio |
 
-`GET /actuator/health` backs the Docker healthchecks.
+`GET /actuator/health` backs the Docker/Render health checks.
 
-Because `<audio>` and `EventSource` cannot send headers, those two endpoints also
-accept the token as `?token=`.
+Because `<audio>` tags and `EventSource` cannot set request headers, those two endpoints
+also accept the token as `?token=`.
+
+---
+
+## Running locally
+
+The full queue-based pipeline runs with Docker Compose:
+
+```bash
+cp .env.example .env          # set JWT_SECRET at minimum
+docker compose up --build     # starts postgres, rabbitmq, backend, worker, web
+```
+
+Then open <http://localhost:8080>. RabbitMQ's management UI is on
+<http://localhost:15673> and Swagger UI on
+<http://localhost:8080/swagger-ui.html>.
+
+To run the services individually:
+
+```bash
+# Postgres + RabbitMQ only
+docker compose up -d postgres rabbitmq
+
+# Backend (needs FFmpeg installed)
+cd backend && ./mvnw spring-boot:run
+
+# Worker
+cd whisper && uv sync && uv run whisper
+
+# Frontend (dev server proxies /api to :8080)
+cd frontend && npm install && npm run dev
+```
+
+For a broker-free local run, set `TRANSCRIPTION_MODE=whispercpp` (or `api` with a Groq
+key) and start only Postgres and the backend.
+
+---
 
 ## Configuration
 
-Everything is environment-driven; see `.env.example` for the full list. Notable knobs:
+Everything is environment-driven; `.env.example` lists the full set. Notable knobs:
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `WHISPER_MODEL_SIZE` | `base` | `tiny` … `medium`; quality vs speed |
+| `TRANSCRIPTION_MODE` | `queue` | `queue`, `whispercpp`, or `api` |
+| `TRANSCRIPTION_FALLBACK_TO_API` | `false` | Retry via hosted API if the local engine fails |
+| `WHISPER_MODEL_SIZE` | `base` | `tiny` … `medium`; quality vs speed (worker) |
 | `APP_CHUNK_TARGET_SECONDS` | `600` | Preferred chunk length before silence snapping |
 | `APP_CHUNK_SILENCE_NOISE_DB` | `-35` | Silence threshold used when splitting |
 | `APP_STORAGE_RETENTION_DAYS` | `7` | Old audio is deleted after this |
 | `APP_RATE_LIMIT_UPLOADS_PER_MINUTE` | `10` | Per-user upload rate limit |
 | `APP_RATE_LIMIT_MAX_ACTIVE_JOBS` | `3` | Cap on jobs running at once per user |
 | `CHUNK_MAX_ATTEMPTS` | `3` | Retries before a chunk is dead-lettered |
+| `JWT_SECRET` | _dev only_ | **Required** in production (`openssl rand -base64 48`) |
+| `ALLOWED_ORIGINS` | localhost + `*.netlify.app` | CORS allow-list for the frontend |
 
-## Production Checklist
+---
 
-Before going live:
+## Deployment
 
-- [ ] Generate a strong JWT secret: `openssl rand -base64 48`
-- [ ] Change all default passwords (POSTGRES_PASSWORD, RABBITMQ_PASSWORD)
-- [ ] Set `ALLOWED_ORIGINS` to your Netlify URL
-- [ ] Disable Swagger UI in production (set `springdoc.api-docs.enabled=false`)
-- [ ] Use environment variables, never hardcode secrets
-- [ ] Test the full flow: register → upload → wait → view transcript → export
+The hosted stack is **Netlify (frontend) + Render (backend + PostgreSQL)**. The full,
+step-by-step walkthrough lives in [DEPLOYMENT_RENDER_NETLIFY.md](DEPLOYMENT_RENDER_NETLIFY.md);
+the short version:
 
-## Notes and trade-offs
+1. **Backend (Render):** a Docker web service built from `backend/Dockerfile`. Set
+   `SPRING_DATASOURCE_*`, `JWT_SECRET`, and `ALLOWED_ORIGINS` to the Netlify origin.
+2. **Frontend (Netlify):** build `frontend/` and publish `dist/`, with
+   `VITE_API_BASE_URL=https://wave-parser-backend.onrender.com`.
+3. **(Optional) Worker:** for the queue path, run `whisper/` against a broker
+   (e.g. CloudAMQP). Without it, use `whispercpp` or `api` mode.
 
-* Schema is managed by Hibernate (`ddl-auto=update`) rather than Flyway, so an existing
-  local database keeps working. Switching to Flyway with a baseline migration is the
-  natural next step for production.
-* Rate limiting lives in memory, which is correct for a single instance; it would move
-  to Redis if the backend were scaled out.
-* Speaker diarization and the metrics dashboard are intentionally not implemented —
-  both are listed as optional in the design.
-* For a college demo, the free tiers of Render + Netlify work well. Just remember the
-  backend will sleep after 15 minutes of inactivity on Render's free tier.
+Secrets are never committed; all of the above are configured through environment
+variables in the Render/Netlify dashboards.
+
+---
+
+## Design notes and trade-offs
+
+- **Schema is managed by Hibernate** (`ddl-auto=update`) rather than Flyway. Moving to
+  versioned migrations with a baseline is the natural next step for production.
+- **Rate limiting is in-memory**, which is correct for a single backend instance; it
+  would move to Redis if the backend were scaled out.
+- **The worker and backend share a filesystem** in queue mode, because chunk messages
+  carry a local file path. On hosts without a shared disk, use the in-process modes.
+- **Speaker diarization** and a **metrics dashboard** are intentionally out of scope.
+- **The whisper.cpp tiny model** trades some accuracy for a small footprint; the worker
+  path supports larger `base`/`small`/`medium` models for better quality.
